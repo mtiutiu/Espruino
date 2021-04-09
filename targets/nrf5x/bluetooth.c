@@ -16,9 +16,13 @@
 #ifdef BLUETOOTH
 
 #include "jswrap_bluetooth.h"
+#ifdef USE_TERMINAL
+#include "jswrap_terminal.h"
+#endif
 #include "jsinteractive.h"
 #include "jsdevices.h"
 #include "jshardware.h"
+#include "jstimer.h"
 #include "nrf5x_utils.h"
 #include "bluetooth.h"
 #include "bluetooth_utils.h"
@@ -173,7 +177,7 @@ volatile uint16_t                       m_central_conn_handle = BLE_CONN_HANDLE_
 volatile bool nfcEnabled = false;
 #endif
 
-uint16_t bleAdvertisingInterval = DEFAULT_ADVERTISING_INTERVAL;
+uint16_t bleAdvertisingInterval = MSEC_TO_UNITS(BLUETOOTH_ADVERTISING_INTERVAL, UNIT_0_625_MS);           /**< The advertising interval (in units of 0.625 ms). */
 
 volatile BLEStatus bleStatus = 0;
 ble_uuid_t bleUUIDFilter;
@@ -185,7 +189,7 @@ uint8_t nusTxBuf[BLE_NUS_MAX_DATA_LEN];
 /// Number of bytes ready to send inside nusTxBuf
 uint16_t nuxTxBufLength = 0;
 
-#ifdef NRF52
+#ifdef NRF52_SERIES
 #define DYNAMIC_INTERVAL_ADJUSTMENT
 #endif
 /* Dynamic interval adjustment kicks Espruino into a low power mode after
@@ -210,6 +214,23 @@ bool bleHighInterval;
 
 static ble_gap_sec_params_t get_gap_sec_params();
 
+/// for BLEP_ADV_REPORT
+typedef struct {
+  ble_gap_addr_t            peer_addr;
+  int8_t                    rssi;                  /**< Received Signal Strength Indication in dBm of the last packet received. */
+  uint8_t        dlen;                  /**< Advertising or scan response data length. */
+  uint8_t        data[BLE_GAP_ADV_MAX_SIZE];    /**< Advertising or scan response data. */
+} BLEAdvReportData;
+
+#if NRF_SD_BLE_API_VERSION>5
+ // if m_scan_param.extended=1, use BLE_GAP_SCAN_BUFFER_EXTENDED_MIN
+uint8_t m_scan_buffer_data[BLE_GAP_SCAN_BUFFER_MIN]; /**< buffer where advertising reports will be stored by the SoftDevice. */
+ble_data_t m_scan_buffer = {
+   m_scan_buffer_data,
+   BLE_GAP_SCAN_BUFFER_MIN
+};
+#endif
+
 // -----------------------------------------------------------------------------------
 // -----------------------------------------------------------------------------------
 
@@ -231,6 +252,8 @@ JsVar *jsble_get_error_string(uint32_t err_code) {
                                 : name="INVALID_CONN_HANDLE"; break;
    case BLE_ERROR_GAP_INVALID_BLE_ADDR
                                 : name="INVALID_BLE_ADDR"; break;
+   case NRF_ERROR_CONN_COUNT    : name="CONN_COUNT"; break;
+
 #if NRF_SD_BLE_API_VERSION<5
    case BLE_ERROR_NO_TX_PACKETS : name="NO_TX_PACKETS"; break;
 #endif
@@ -325,16 +348,10 @@ int jsble_exec_pending(IOEvent *event) {
      break;
    }
    case BLEP_ADV_REPORT: {
-     ble_gap_evt_adv_report_t *p_adv = (ble_gap_evt_adv_report_t *)buffer;
-#if NRF_SD_BLE_API_VERSION<6
-     int dataLen = p_adv->dlen;
-     char *dataPtr = (char*)p_adv->data;
-#else
-     int dataLen = p_adv->data.len;
-     char *dataPtr = (char*)p_adv->data.p_data;
-#endif
-     size_t len = sizeof(ble_gap_evt_adv_report_t) + dataLen - BLE_GAP_ADV_MAX_SIZE;
+     BLEAdvReportData *p_adv = (BLEAdvReportData *)buffer;
+     size_t len = sizeof(BLEAdvReportData) + p_adv->dlen - BLE_GAP_ADV_MAX_SIZE;
      if (bufferLen != len) {
+       jsiConsolePrintf("%d %d %d\n", bufferLen,len,p_adv->dlen);
        assert(0);
        break;
      }
@@ -343,9 +360,9 @@ int jsble_exec_pending(IOEvent *event) {
        jsvObjectSetChildAndUnLock(evt, "rssi", jsvNewFromInteger(p_adv->rssi));
        //jsvObjectSetChildAndUnLock(evt, "addr_type", jsvNewFromInteger(blePendingAdvReport.peer_addr.addr_type));
        jsvObjectSetChildAndUnLock(evt, "id", bleAddrToStr(p_adv->peer_addr));
-       JsVar *data = jsvNewStringOfLength(dataLen, dataPtr);
+       JsVar *data = jsvNewStringOfLength(p_adv->dlen, (char*)p_adv->data);
        if (data) {
-         JsVar *ab = jsvNewArrayBufferFromString(data, dataLen);
+         JsVar *ab = jsvNewArrayBufferFromString(data, p_adv->dlen);
          jsvUnLock(data);
          jsvObjectSetChildAndUnLock(evt, "data", ab);
        }
@@ -495,7 +512,8 @@ int jsble_exec_pending(IOEvent *event) {
      break;
    }
    case BLEP_CENTRAL_DISCONNECTED: {
-     bleCompleteTaskSuccess(BLETASK_DISCONNECT, bleTaskInfo);
+     if (bleInTask(BLETASK_DISCONNECT))
+       bleCompleteTaskSuccess(BLETASK_DISCONNECT, bleTaskInfo);
      JsVar *gattServer = bleGetActiveBluetoothGattServer();
      if (gattServer) {
        JsVar *bluetoothDevice = jsvObjectGetChild(gattServer, "device", 0);
@@ -523,7 +541,7 @@ int jsble_exec_pending(IOEvent *event) {
          JsVar *evt = jsvNewObject();
          if (evt) {
            jsvObjectSetChild(evt, "target", characteristic);
-           jsiQueueObjectCallbacks(characteristic, JS_EVENT_PREFIX"characteristicvaluechanged", &evt, 1);
+           jsiExecuteEventCallbackName(characteristic, JS_EVENT_PREFIX"characteristicvaluechanged", 1, &evt);
            jshHadEvent();
            jsvUnLock(evt);
          }
@@ -619,6 +637,7 @@ uint8_t match_request : 1;               If 1 requires the application to report
         break;
       }
       case BLEP_TASK_AUTH_KEY_REQUEST: {
+        //jsiConsolePrintf("BLEP_TASK_AUTH_KEY_REQUEST\n");
         uint16_t conn_handle = data;
         if (conn_handle == m_central_conn_handle) {
           JsVar *gattServer = bleGetActiveBluetoothGattServer();
@@ -783,11 +802,23 @@ void ble_app_error_handler(uint32_t error_code, uint32_t line_num, const uint8_t
 #ifdef LED3_PININDEX
   jshPinOutput(LED3_PININDEX, LED3_ONSTATE);
 #endif
-  jsiConsolePrintf("NRF ERROR 0x%x at %s:%d\n", error_code, p_file_name?(const char *)p_file_name:"?", line_num);
-  jsiConsolePrint("REBOOTING.\n");
+  jsiConsolePrintf("NRF ERROR 0x%x\n at %s:%d\nREBOOTING.\n", error_code, p_file_name?(const char *)p_file_name:"?", line_num);
+
+#ifdef USE_TERMINAL
+  // If we have a terminal, try and write to that!
+  jsiStatus  |= JSIS_ECHO_OFF;
+  jsiSetConsoleDevice(EV_TERMINAL, 1);
+  jsiConsolePrintf("NRF ERROR 0x%x\n at %s:%d\nREBOOTING.\n", error_code, p_file_name?(const char *)p_file_name:"?", line_num);
+  jswrap_terminal_idle();
+#endif
+
   /* don't flush - just delay. If this happened in an IRQ, waiting to flush
    * will result in the device locking up. */
+#ifdef USE_TERMINAL
+  nrf_delay_ms(10000);
+#else
   nrf_delay_ms(1000);
+#endif
   NVIC_SystemReset();
 }
 
@@ -952,22 +983,13 @@ void nus_transmit_string() {
 
 #if NRF_SD_BLE_API_VERSION>5
     uint32_t err_code = ble_nus_data_send(&m_nus, nusTxBuf, &nuxTxBufLength, m_peripheral_conn_handle);
-    if (err_code == NRF_SUCCESS) nuxTxBufLength=0; // everything sent Ok
 #elif NRF_SD_BLE_API_VERSION<5
     uint32_t err_code = ble_nus_string_send(&m_nus, nusTxBuf, nuxTxBufLength);
-    if (err_code == NRF_SUCCESS) nuxTxBufLength=0; // everything sent Ok
-#else
-    uint16_t bytesSent = nuxTxBufLength;
-    uint32_t err_code = ble_nus_string_send(&m_nus, nusTxBuf, &bytesSent);
-    if (nuxTxBufLength==bytesSent) {
-      nuxTxBufLength = 0;
-    } else if (bytesSent) {
-      for (uint16_t n=bytesSent;n<nuxTxBufLength;n++)
-        nusTxBuf[n-bytesSent] = nusTxBuf[n];
-      nuxTxBufLength -= bytesSent;
-    }
+#else // NRF_SD_BLE_API_VERSION==5
+    uint32_t err_code = ble_nus_string_send(&m_nus, nusTxBuf, &nuxTxBufLength);
 #endif
     if (err_code == NRF_SUCCESS) {
+      nuxTxBufLength=0; // everything sent Ok
       bleStatus |= BLE_IS_SENDING;
     } else if (err_code==NRF_ERROR_INVALID_STATE) {
       // If no notifications we are connected but the central isn't reading, so sends will fail.
@@ -1028,7 +1050,7 @@ void SWI1_IRQHandler(bool radio_evt) {
  }
 #endif
 
-#ifndef NRF52
+#ifndef NRF52_SERIES
   /* NRF52 has a systick. On nRF51 we just hook on
   to this, since it happens quite often */
   void SysTick_Handler(void);
@@ -1162,7 +1184,7 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context) {
           jsble_queue_pending(BLEP_DISCONNECTED, p_ble_evt->evt.gap_evt.params.disconnected.reason);
         }
         if ((bleStatus & BLE_NEEDS_SOFTDEVICE_RESTART) && !jsble_has_connection())
-          jsble_restart_softdevice();
+          jsble_restart_softdevice(NULL);
 
         break;
 
@@ -1203,13 +1225,18 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context) {
       case BLE_GAP_EVT_AUTH_KEY_REQUEST:
           jsble_queue_pending(BLEP_TASK_AUTH_KEY_REQUEST, p_ble_evt->evt.gap_evt.conn_handle);
           break;
-      case BLE_GAP_EVT_LESC_DHKEY_REQUEST:
-          //jsiConsolePrintf("BLE_GAP_EVT_LESC_DHKEY_REQUEST\n");
-          err_code = ecc_p256_shared_secret_compute(&m_lesc_sk.sk[0], &p_ble_evt->evt.gap_evt.params.lesc_dhkey_request.p_pk_peer->pk[0], &m_lesc_dhkey.key[0]);
+      case BLE_GAP_EVT_LESC_DHKEY_REQUEST: {
+        /* Nordic SDK gives us request.p_pk_peer, but it's UNALIGNED! Then the next command
+           (taken straight from their SDK) fails with an error because it isn't aligned.
+           We have to manually copy the key to a new, aligned value.  */
+          ble_gap_lesc_p256_pk_t key;
+          memcpy(&key.pk[0], &p_ble_evt->evt.gap_evt.params.lesc_dhkey_request.p_pk_peer->pk[0], sizeof(ble_gap_lesc_p256_pk_t));
+          err_code = ecc_p256_shared_secret_compute(&m_lesc_sk.sk[0], &key.pk[0], &m_lesc_dhkey.key[0]);
           APP_ERROR_CHECK_NOT_URGENT(err_code);
           err_code = sd_ble_gap_lesc_dhkey_reply(p_ble_evt->evt.gap_evt.conn_handle, &m_lesc_dhkey);
           APP_ERROR_CHECK_NOT_URGENT(err_code);
           break;
+      }
        case BLE_GAP_EVT_AUTH_STATUS:
           jsble_queue_pending_buf(
               BLEP_TASK_AUTH_STATUS,
@@ -1360,14 +1387,23 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context) {
       case BLE_GAP_EVT_ADV_REPORT: {
         // Advertising data received
         const ble_gap_evt_adv_report_t *p_adv = &p_ble_evt->evt.gap_evt.params.adv_report;
+        BLEAdvReportData adv;
+        adv.peer_addr = p_adv->peer_addr;
+        adv.rssi = p_adv->rssi;
 #if NRF_SD_BLE_API_VERSION<6
-        size_t dlen = p_adv->dlen;
+        adv.dlen = p_adv->dlen;
+        memcpy(adv.data, p_adv->data, adv.dlen);
 #else
-        // FIXME - we're no longer including the actual advertising data in the packet, just a pointer!
-        size_t dlen = p_adv->data.len;
+        adv.dlen = p_adv->data.len;
+        memcpy(adv.data, p_adv->data.p_data, adv.dlen);
 #endif
-        size_t len = sizeof(ble_gap_evt_adv_report_t) + dlen - BLE_GAP_ADV_MAX_SIZE;
-        jsble_queue_pending_buf(BLEP_ADV_REPORT, 0, (char*)p_adv, len);
+        size_t len = sizeof(BLEAdvReportData) + adv.dlen - BLE_GAP_ADV_MAX_SIZE;
+        jsble_queue_pending_buf(BLEP_ADV_REPORT, 0, (char*)&adv, len);
+#if NRF_SD_BLE_API_VERSION>5
+        // On new APIs we need to continue scanning
+        err_code = sd_ble_gap_scan_start(NULL, &m_scan_buffer);
+        APP_ERROR_CHECK(err_code);
+#endif
         break;
         }
 
@@ -1910,11 +1946,13 @@ static ble_gap_sec_params_t get_gap_sec_params() {
 
 void jsble_update_security() {
 #if PEER_MANAGER_ENABLED
+  bool encryptUart = false;
   ble_gap_sec_params_t sec_param = get_gap_sec_params();
+  // encrypt UART for out of band pairing
+  if (sec_param.oob) encryptUart = true;
 
   uint32_t err_code = pm_sec_params_set(&sec_param);
   jsble_check_error(err_code);
-#endif
 
   JsVar *options = jsvObjectGetChild(execInfo.hiddenRoot, BLE_NAME_SECURITY, 0);
   if (jsvIsObject(options)) {
@@ -1924,12 +1962,25 @@ void jsble_update_security() {
     v = jsvObjectGetChild(options, "passkey", 0);
     if (jsvIsString(v)) jsvGetString(v, (char*)passkey, sizeof(passkey));
     jsvUnLock(v);
-
+    //jsiConsolePrintf("PASSKEY %d %d %d %d %d %d\n",passkey[0],passkey[1],passkey[2],passkey[3],passkey[4],passkey[5]);
     ble_opt_t pin_option;
-    pin_option.gap_opt.passkey.p_passkey = passkey[0] ? passkey : NULL;
+    pin_option.gap_opt.passkey.p_passkey = NULL;
+    if (passkey[0]) {
+      pin_option.gap_opt.passkey.p_passkey = passkey;
+      encryptUart = true;
+    }
     uint32_t err_code =  sd_ble_opt_set(BLE_GAP_OPT_PASSKEY, &pin_option);
     jsble_check_error(err_code);
   }
+  // If UART encryption status changed, we need to update flags and restart Bluetooth
+  if (((bleStatus&BLE_ENCRYPT_UART)!=0) != encryptUart) {
+    if (encryptUart) bleStatus |= BLE_ENCRYPT_UART;
+    else bleStatus &= ~BLE_ENCRYPT_UART;
+    // But only restart if the UART was enabled
+    if (bleStatus & BLE_NUS_INITED)
+      bleStatus |= BLE_NEEDS_SOFTDEVICE_RESTART;
+  }
+#endif
 }
 
 #if PEER_MANAGER_ENABLED
@@ -2057,17 +2108,28 @@ static void hids_init(uint8_t *reportPtr, size_t reportLen) {
     p_input_report->rep_ref.report_id   = HID_INPUT_REP_REF_ID;
     p_input_report->rep_ref.report_type = BLE_HIDS_REP_TYPE_INPUT;
 
+#if NRF_SD_BLE_API_VERSION>=7
+    p_input_report->sec.cccd_wr = SEC_JUST_WORKS;
+    p_input_report->sec.wr      = SEC_JUST_WORKS;
+    p_input_report->sec.rd      = SEC_JUST_WORKS;
+#else
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&p_input_report->security_mode.cccd_write_perm);
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&p_input_report->security_mode.read_perm);
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&p_input_report->security_mode.write_perm);
+#endif
 
     p_output_report                      = &output_report_array[HID_OUTPUT_REPORT_INDEX];
     p_output_report->max_len             = HID_OUTPUT_REPORT_MAX_LEN;
     p_output_report->rep_ref.report_id   = HID_OUTPUT_REP_REF_ID;
     p_output_report->rep_ref.report_type = BLE_HIDS_REP_TYPE_OUTPUT;
 
+#if NRF_SD_BLE_API_VERSION>=7
+    p_output_report->sec.wr      = SEC_JUST_WORKS;
+    p_output_report->sec.rd      = SEC_JUST_WORKS;
+#else
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&p_output_report->security_mode.read_perm);
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&p_output_report->security_mode.write_perm);
+#endif
 
     hid_info_flags = HID_INFO_FLAG_REMOTE_WAKE_MSK | HID_INFO_FLAG_NORMALLY_CONNECTABLE_MSK;
 
@@ -2091,6 +2153,20 @@ static void hids_init(uint8_t *reportPtr, size_t reportLen) {
     hids_init_obj.included_services_count        = 0;
     hids_init_obj.p_included_services_array      = NULL;
 
+#if NRF_SD_BLE_API_VERSION>=7
+    hids_init_obj.rep_map.rd_sec         = SEC_JUST_WORKS;
+    hids_init_obj.hid_information.rd_sec = SEC_JUST_WORKS;
+
+    hids_init_obj.boot_kb_inp_rep_sec.cccd_wr = SEC_JUST_WORKS;
+    hids_init_obj.boot_kb_inp_rep_sec.rd      = SEC_JUST_WORKS;
+
+    hids_init_obj.boot_kb_outp_rep_sec.rd = SEC_JUST_WORKS;
+    hids_init_obj.boot_kb_outp_rep_sec.wr = SEC_JUST_WORKS;
+
+    hids_init_obj.protocol_mode_rd_sec = SEC_JUST_WORKS;
+    hids_init_obj.protocol_mode_wr_sec = SEC_JUST_WORKS;
+    hids_init_obj.ctrl_point_wr_sec    = SEC_JUST_WORKS;
+#else
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&hids_init_obj.rep_map.security_mode.read_perm);
     BLE_GAP_CONN_SEC_MODE_SET_NO_ACCESS(&hids_init_obj.rep_map.security_mode.write_perm);
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&hids_init_obj.hid_information.security_mode.read_perm);
@@ -2107,6 +2183,7 @@ static void hids_init(uint8_t *reportPtr, size_t reportLen) {
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&hids_init_obj.security_mode_protocol.write_perm);
     BLE_GAP_CONN_SEC_MODE_SET_NO_ACCESS(&hids_init_obj.security_mode_ctrl_point.read_perm);
     BLE_GAP_CONN_SEC_MODE_SET_ENC_NO_MITM(&hids_init_obj.security_mode_ctrl_point.write_perm);
+#endif
 
     err_code = ble_hids_init(&m_hids, &hids_init_obj);
     APP_ERROR_CHECK(err_code);
@@ -2141,6 +2218,14 @@ static void services_init() {
       ble_nus_init_t nus_init;
       memset(&nus_init, 0, sizeof(nus_init));
       nus_init.data_handler = nus_data_handler;
+#if (NRF_SD_BLE_API_VERSION==3) || (NRF_SD_BLE_API_VERSION==6)
+      if (bleStatus & BLE_ENCRYPT_UART)
+        nus_init.encrypt = true;
+#else
+#if PEER_MANAGER_ENABLED
+#warning "No security on Nordic UART for this softdevice"
+#endif
+#endif
       err_code = ble_nus_init(&m_nus, &nus_init);
       APP_ERROR_CHECK(err_code);
       bleStatus |= BLE_NUS_INITED;
@@ -2167,17 +2252,20 @@ static void ble_stack_init() {
 
     uint32_t err_code;
 
-    // TODO: enable if we're on a device with 32kHz xtal
-    /*nrf_clock_lf_cfg_t clock_lf_cfg = {
+    nrf_clock_lf_cfg_t clock_lf_cfg = {
+#ifdef ESPR_LSE_ENABLE
+    // enable if we're on a device with 32kHz xtal
         .source        = NRF_CLOCK_LF_SRC_XTAL,
         .rc_ctiv       = 0,
         .rc_temp_ctiv  = 0,
-        .xtal_accuracy = NRF_CLOCK_LF_XTAL_ACCURACY_20_PPM};*/
-    nrf_clock_lf_cfg_t clock_lf_cfg = {
-            .source        = NRF_CLOCK_LF_SRC_RC,
-            .rc_ctiv       = 16, // recommended for nRF52
-            .rc_temp_ctiv  = 2,  // recommended for nRF52
-            .xtal_accuracy = 0};
+        .xtal_accuracy = NRF_CLOCK_LF_XTAL_ACCURACY_20_PPM,
+#else
+        .source        = NRF_CLOCK_LF_SRC_RC,
+        .rc_ctiv       = 16, // recommended for nRF52
+        .rc_temp_ctiv  = 2,  // recommended for nRF52
+        .xtal_accuracy = 0
+#endif
+    };
 
     // Initialize SoftDevice.
     SOFTDEVICE_HANDLER_INIT(&clock_lf_cfg, false);
@@ -2188,7 +2276,7 @@ static void ble_stack_init() {
                                                     &ble_enable_params);
     APP_ERROR_CHECK(err_code);
 
-#ifdef NRF52
+#ifdef NRF52_SERIES
     ble_enable_params.common_enable_params.vs_uuid_count = 10;
 #else
     ble_enable_params.common_enable_params.vs_uuid_count = 3;
@@ -2234,7 +2322,7 @@ static void ble_stack_init() {
     NRF_SDH_SOC_OBSERVER(m_soc_observer, APP_SOC_OBSERVER_PRIO, soc_evt_handler, NULL);
 #endif
 
-#if defined(PUCKJS) || defined(RUUVITAG)
+#if defined(PUCKJS) || defined(RUUVITAG) || defined(ESPR_DCDC_ENABLE)
     // can only be enabled if we're sure we have a DC-DC
     err_code = sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE);
     APP_ERROR_CHECK(err_code);
@@ -2337,9 +2425,8 @@ uint32_t jsble_advertising_start() {
 
   //jsiConsolePrintf("adv_data_set %d %d\n", advPtr, advLen);
 #if NRF_SD_BLE_API_VERSION>5
-  uint8_t m_enc_advdata[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
   ble_gap_adv_data_t d;
-  d.adv_data.p_data = advPtr;
+  d.adv_data.p_data = (uint8_t*)advPtr;
   d.adv_data.len = advLen;
   d.scan_rsp_data.p_data = m_enc_scan_response_data;
   d.scan_rsp_data.len = m_enc_scan_response_data_len;
@@ -2394,7 +2481,7 @@ void jsble_advertising_stop() {
    uint32_t err_code;
    ble_stack_init();
    err_code = radio_notification_init(
- #ifdef NRF52
+ #ifdef NRF52_SERIES
                            6, /* IRQ Priority -  Must be 6 on nRF52. 7 doesn't work */
  #else
                            3, /* IRQ Priority -  nRF51 has different IRQ structure */
@@ -2403,7 +2490,7 @@ void jsble_advertising_stop() {
                            NRF_RADIO_NOTIFICATION_DISTANCE_NONE);
    APP_ERROR_CHECK(err_code);
 
-#ifdef NRF52
+#ifdef NRF52_SERIES
    // Set MAC address
    JsVar *v = jsvObjectGetChild(execInfo.hiddenRoot, BLE_NAME_MAC_ADDRESS,0);
    if (v) {
@@ -2418,6 +2505,21 @@ void jsble_advertising_stop() {
      }
    }
    jsvUnLock(v);
+/*
+   // This sets the MAC address to the default address, but "public", not "random"
+   uint32_t addr0 =  NRF_FICR->DEVICEADDR[0];
+   uint32_t addr1 =  NRF_FICR->DEVICEADDR[1];
+   ble_gap_addr_t addr;
+   addr.addr_type = BLE_GAP_ADDR_TYPE_PUBLIC;
+   addr.addr[5] = ((addr1>>8 )&0xFF)|0xC0;
+   addr.addr[4] = ((addr1    )&0xFF);
+   addr.addr[3] = ((addr0>>24)&0xFF);
+   addr.addr[2] = ((addr0>>16)&0xFF);
+   addr.addr[1] = ((addr0>> 8)&0xFF);
+   addr.addr[0] = ((addr0    )&0xFF);
+   err_code = sd_ble_gap_addr_set(&addr);
+   if (err_code) jsiConsolePrintf("sd_ble_gap_addr_set failed: 0x%x\n", err_code);
+ */
 #endif
 
 #if PEER_MANAGER_ENABLED
@@ -2426,6 +2528,8 @@ void jsble_advertising_stop() {
    gap_params_init();
    services_init();
    conn_params_init();
+   // reset the status for things that aren't happening now we're rebooted
+   bleStatus &= ~BLE_RESET_ON_SOFTDEVICE_START;
 
    jswrap_ble_wake();
 }
@@ -2441,14 +2545,18 @@ void jsble_kill() {
 
   uint32_t err_code;
 
+#if NRF_SD_BLE_API_VERSION < 5
   err_code = sd_softdevice_disable();
+#else
+  err_code = nrf_sdh_disable_request();
+#endif
   APP_ERROR_CHECK(err_code);
 }
 
 
 /** Stop and restart the softdevice so that we can update the services in it -
  * both user-defined as well as UART/HID */
-void jsble_restart_softdevice() {
+void jsble_restart_softdevice(JsVar *jsFunction) {
   assert(!jsble_has_connection());
   bleStatus &= ~(BLE_NEEDS_SOFTDEVICE_RESTART | BLE_SERVICES_WERE_SET);
 
@@ -2456,11 +2564,18 @@ void jsble_restart_softdevice() {
   if (bleStatus & BLE_IS_SCANNING) {
     sd_ble_gap_scan_stop();
   }
+  //jsiConsolePrintf("Restart softdevice\n");
 
+  jshUtilTimerDisable(); // don't want the util timer firing during this!
+  JsSysTime lastTime = jshGetSystemTime();
   jsble_kill();
+  if (jsvIsFunction(jsFunction))
+    jspExecuteFunction(jsFunction,NULL,0,NULL);
   jsble_init();
   // reinitialise everything
   jswrap_ble_reconfigure_softdevice();
+  jshSetSystemTime(lastTime); // Softdevice resets the RTC - so we must reset our offsets
+  jstRestartUtilTimer(); // restart the util timer
 }
 
 uint32_t jsble_set_scanning(bool enabled, bool activeScan) {
@@ -2469,18 +2584,16 @@ uint32_t jsble_set_scanning(bool enabled, bool activeScan) {
      if (bleStatus & BLE_IS_SCANNING) return 0;
      bleStatus |= BLE_IS_SCANNING;
      ble_gap_scan_params_t     m_scan_param;
+     memset(&m_scan_param,0,sizeof(m_scan_param));
 #if NRF_SD_BLE_API_VERSION>5
-     static uint8_t m_scan_buffer_data[BLE_GAP_SCAN_BUFFER_EXTENDED_MIN]; /**< buffer where advertising reports will be stored by the SoftDevice. */
-     static ble_data_t m_scan_buffer = {
-         m_scan_buffer_data,
-         BLE_GAP_SCAN_BUFFER_EXTENDED_MIN
-     };
+     m_scan_param.scan_phys         = BLE_GAP_PHY_AUTO;
+     m_scan_param.filter_policy     = BLE_GAP_SCAN_FP_ACCEPT_ALL;
 #endif
      // non-selective scan
      m_scan_param.active       = activeScan;   // Active scanning set.
      m_scan_param.interval     = SCAN_INTERVAL;// Scan interval.
      m_scan_param.window       = SCAN_WINDOW;  // Scan window.
-     m_scan_param.timeout      = 0x0000;       // No timeout.
+     m_scan_param.timeout      = 0x0000;       // No timeout - BLE_GAP_SCAN_TIMEOUT_UNLIMITED
 
      err_code = sd_ble_gap_scan_start(&m_scan_param
 #if NRF_SD_BLE_API_VERSION>5
@@ -2992,9 +3105,10 @@ void jsble_central_characteristicNotify(JsVar *characteristic, bool enable) {
   if (!jsble_has_central_connection())
     return bleCompleteTaskFailAndUnLock(BLETASK_CHARACTERISTIC_NOTIFY, jsvNewFromString("Not connected"));
 
-  uint16_t cccd_handle = jsvGetIntegerAndUnLock(jsvObjectGetChild(characteristic, "handle_cccd", 0));
-  if (!cccd_handle)
+  JsVar *cccdVar = jsvObjectGetChild(characteristic, "handle_cccd", 0);
+  if (!cccdVar)
     return bleCompleteTaskFailAndUnLock(BLETASK_CHARACTERISTIC_NOTIFY, jsvNewFromString("handle_cccd not set"));
+  uint16_t cccd_handle = jsvGetIntegerAndUnLock(cccdVar);
 
   uint8_t buf[BLE_CCCD_VALUE_LEN];
   buf[0] = 0;

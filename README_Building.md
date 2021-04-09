@@ -16,11 +16,9 @@ make clean && make
 * ```RELEASE=1``` for performance and code size, without it, assertions are kept for debugging.
 * ```DEBUG=1``` is available.
 
-## Under Linux
+## Under Linux (recommended)
 
 Espruino is easy to build under Linux, for either for Espruino running on Linux or a board.
-
-The current reference OS for building is Ubuntu 16.04.1 LTS, and the following can ensure problem free development:
 
 ### Easy Method : provision.sh
 
@@ -35,7 +33,10 @@ This should work for common platforms on Linux, but will only set
 paths up for your current session. You'll have to run it again
 next time you log in.
 
-### for Espruino
+### Manual Method
+
+#### For Espruino
+
 
 ```bash
 sudo apt-get update
@@ -51,7 +52,7 @@ make clean && make
 chmod +x espruino && sudo cp espruino /usr/local/bin
 ```
 
-### for an example of cross compilation for Puck.js
+#### for cross compilation to Puck.js
 
 Having successfully created an native OS Espruino, try a cross compilation.
 
@@ -62,7 +63,7 @@ sudo apt-get install -y \
   lib32z1 lib32ncurses5
 wget https://launchpad.net/gcc-arm-embedded/5.0/5-2016-q3-update/+download/gcc-arm-none-eabi-5_4-2016q3-20160926-linux.tar.bz2
 tar xjf gcc-arm-none-eabi-5_4-2016q3-20160926-linux.tar.bz2
-sudo mv gcc-arm-none-eabi-5_4-2016q3-20160926 /usr/local
+sudo mv gcc-arm-none-eabi-5_4-2016q3 /usr/local
 export PATH=/usr/local/gcc-arm-none-eabi-5_4-2016q3/bin:$PATH
 cd ~/source/repos/github/espruino/Espruino
 make clean && DFU_UPDATE_BUILD=1 BOARD=PUCKJS RELEASE=1 make
@@ -387,7 +388,7 @@ Note:
 * For your host OS (Windows or MacOS)
   * Download and install [VirtualBox](https://www.virtualbox.org/)
   * Download and install [Vagrant](https://www.vagrantup.com/downloads.html)
-  * Note: for MacOS, the two previous steps can be accomplished easily with [Homebrew Cask](http://caskroom.io)
+  * Note: for MacOS, the two previous steps can be accomplished easily with [Homebrew Cask](https://brew.sh)
     * `brew cask install virtualbox vagrant`
 * Clone this repository and navigate with the command prompt to the contents
 * Install the auto-network plugin
