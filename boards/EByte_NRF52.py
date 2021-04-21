@@ -16,16 +16,16 @@
 import pinutils;
 
 info = {
- 'name' : "Holyiot NRF52 Module",
+ 'name' : "EByte NRF52 Module",
  'link' :  [],
  'espruino_page_link' : '',
  'default_console' : "EV_SERIAL1",
- 'default_console_tx' : "D2",
- 'default_console_rx' : "D3",
+ 'default_console_tx' : "D6",
+ 'default_console_rx' : "D8",
  'default_console_baudrate' : "9600",
  'variables' : 2500, # How many variables are allocated for Espruino to use. RAM will be overflowed if this number is too high and code won't compile.
  #'bootloader' : 1,
- 'binary_name' : 'espruino_%v_holyiot_nrf52.hex',
+ 'binary_name' : 'espruino_%v_ebyte_nrf52.hex',
  'build' : {
    'optimizeflags' : '-Os',
    'libraries' : [
@@ -33,7 +33,7 @@ info = {
    ],
    'makefile' : [
      'DEFINES+=-DHAL_NFC_ENGINEERING_BC_FTPAN_WORKAROUND=1', # Looks like proper production nRF52s had this issue
-     'DEFINES+=-DBLUETOOTH_NAME_PREFIX=\'"Holyiot_NRF52"\'',
+     'DEFINES+=-DBLUETOOTH_NAME_PREFIX=\'"EByte_NRF52"\'',
      'DEFINES+=-DESPR_DCDC_ENABLE',
      'DEFINES+=-DNRF_BLE_GATT_MAX_MTU_SIZE=53 -DNRF_BLE_MAX_MTU_SIZE=53', # increase MTU from default of 23
      'LDFLAGS += -Xlinker --defsym=LD_APP_RAM_BASE=0x2c40'  # set RAM base to match MTU
