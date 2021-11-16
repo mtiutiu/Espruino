@@ -43,6 +43,11 @@
 
 // ----------------------------------------------------------------------------------------------
 
+#ifdef GRAPHICS_THEME
+/// Global color scheme colours
+JsGraphicsTheme graphicsTheme;
+#endif
+
 static void graphicsSetPixelDevice(JsGraphics *gfx, int x, int y, unsigned int col);
 
 void graphicsFallbackSetPixel(JsGraphics *gfx, int x, int y, unsigned int col) {
@@ -66,44 +71,55 @@ void graphicsFallbackFillRect(JsGraphics *gfx, int x1, int y1, int x2, int y2, u
       graphicsSetPixelDevice(gfx,x,y, col);
 }
 
-void graphicsFallbackScrollX(JsGraphics *gfx, int xdir, int yfrom, int yto) {
+void graphicsFallbackBlit(JsGraphics *gfx, int x1, int y1, int w, int h, int x2, int y2) {
+  for (int y=0;y<h;y++)
+    for (int x=0;x<w;x++)
+      gfx->setPixel(gfx, (int)(x+x2),(int)(y+y2),
+        gfx->getPixel(gfx, (int)(x+x1),(int)(y+y1)));
+}
+
+void graphicsFallbackScrollX(JsGraphics *gfx, int xdir, int yfrom, int yto, int x1, int x2) {
   int x;
   if (xdir<=0) {
-    int w = gfx->data.width+xdir;
-    for (x=0;x<w;x++)
+    int w = x2+xdir;
+    for (x=x1;x<=w;x++)
       gfx->setPixel(gfx, (int)x,(int)yto,
           gfx->getPixel(gfx, (int)(x-xdir),(int)yfrom));
   } else { // >0
-    for (x=gfx->data.width-xdir-1;x>=0;x--)
+    for (x=x2-xdir;x>=x1;x--)
       gfx->setPixel(gfx, (int)(x+xdir),(int)yto,
           gfx->getPixel(gfx, (int)x,(int)yfrom));
   }
 }
 
-void graphicsFallbackScroll(JsGraphics *gfx, int xdir, int ydir) {
+void graphicsFallbackScroll(JsGraphics *gfx, int xdir, int ydir, int x1, int y1, int x2, int y2) {
   if (xdir==0 && ydir==0) return;
   int y;
   if (ydir<=0) {
-    int h = gfx->data.height+ydir;
-    for (y=0;y<h;y++)
-      graphicsFallbackScrollX(gfx, xdir, y-ydir, y);
+    int h = y2+ydir;
+    for (y=y1;y<=h;y++)
+      graphicsFallbackScrollX(gfx, xdir, y-ydir, y, x1, x2);
   } else { // >0
-    for (y=gfx->data.height-ydir-1;y>=0;y--)
-      graphicsFallbackScrollX(gfx, xdir, y, y+ydir);
+    for (y=y2-ydir;y>=y1;y--)
+      graphicsFallbackScrollX(gfx, xdir, y, y+ydir, x1, x2);
   }
-#ifndef NO_MODIFIED_AREA
-  gfx->data.modMinX=0;
-  gfx->data.modMinY=0;
-  gfx->data.modMaxX=(short)(gfx->data.width-1);
-  gfx->data.modMaxY=(short)(gfx->data.height-1);
-#endif
 }
 
 // ----------------------------------------------------------------------------------------------
 
 void graphicsStructResetState(JsGraphics *gfx) {
-  gfx->data.fgColor = 0xFFFFFFFF;
-  gfx->data.bgColor = 0;
+#ifdef GRAPHICS_THEME
+  // Only set theme for OS-provided graphics (not arraybuffer/etc)
+  if (gfx->data.type!=JSGRAPHICSTYPE_ARRAYBUFFER &&
+      gfx->data.type!=JSGRAPHICSTYPE_JS) {
+    gfx->data.fgColor = graphicsTheme.fg;
+    gfx->data.bgColor = graphicsTheme.bg;
+  } else
+#endif
+  {
+    gfx->data.fgColor = 0xFFFFFFFF;
+    gfx->data.bgColor = 0;
+  }
   gfx->data.fontSize = 1+JSGRAPHICS_FONTSIZE_4X6;
 #ifndef SAVE_ON_FLASH
   gfx->data.fontAlignX = 3;
@@ -137,6 +153,7 @@ void graphicsStructInit(JsGraphics *gfx, int width, int height, int bpp) {
 }
 
 bool graphicsGetFromVar(JsGraphics *gfx, JsVar *parent) {
+  if (!parent) return false;
   gfx->graphicsVar = parent;
   JsVar *data = jsvObjectGetChild(parent, JS_HIDDEN_CHAR_STR"gfx", 0);
   assert(data);
@@ -146,6 +163,7 @@ bool graphicsGetFromVar(JsGraphics *gfx, JsVar *parent) {
     gfx->setPixel = graphicsFallbackSetPixel;
     gfx->getPixel = graphicsFallbackGetPixel;
     gfx->fillRect = graphicsFallbackFillRect;
+    gfx->blit = graphicsFallbackBlit;
     gfx->scroll = graphicsFallbackScroll;
 #ifdef USE_LCD_SDL
     if (gfx->data.type == JSGRAPHICSTYPE_SDL) {
@@ -259,6 +277,16 @@ bool graphicsSetModifiedAndClip(JsGraphics *gfx, int *x1, int *y1, int *x2, int 
   return modified;
 }
 
+// Set the area modified by a draw command
+void graphicsSetModified(JsGraphics *gfx, int x1, int y1, int x2, int y2) {
+#ifndef NO_MODIFIED_AREA
+  if (x1 < gfx->data.modMinX) { gfx->data.modMinX=(short)x1; }
+  if (x2 > gfx->data.modMaxX) { gfx->data.modMaxX=(short)x2; }
+  if (y1 < gfx->data.modMinY) { gfx->data.modMinY=(short)y1; }
+  if (y2 > gfx->data.modMaxY) { gfx->data.modMaxY=(short)y2; }
+#endif
+}
+
 /// Get a setPixel function (assuming coordinates already clipped with graphicsSetModifiedAndClip) - if all is ok it can choose a faster draw function
 JsGraphicsSetPixelFn graphicsGetSetPixelFn(JsGraphics *gfx) {
   if (gfx->data.flags & JSGRAPHICSFLAGS_MAPPEDXY)
@@ -279,8 +307,9 @@ JsGraphicsSetPixelFn graphicsGetSetPixelUnclippedFn(JsGraphics *gfx, int x1, int
 /// Merge one color into another based on current bit depth (amt is 0..256)
 uint32_t graphicsBlendColor(JsGraphics *gfx, unsigned int fg, unsigned int bg, int iamt) {
   unsigned int amt = (iamt>0) ? (unsigned)iamt : 0;
-  if (amt>255) amt=255;
+  if (amt>256) amt=256;
   if (gfx->data.bpp==2 || gfx->data.bpp==4 || gfx->data.bpp==8) {
+    // TODO: if our graphics instance is paletted this isn't correct!
     return (bg*(256-amt) + fg*amt) >> 8;
   } else if (gfx->data.bpp==16) { // Blend from bg to fg
     unsigned int b = bg;
@@ -324,6 +353,7 @@ uint32_t graphicsBlendColor(JsGraphics *gfx, unsigned int fg, unsigned int bg, i
     unsigned int bi = (bb*(256-amt) + fb*amt) >> 8;
     return (bi | gi<<8 | ri<<16);
   }
+  // Memory LCD is 3 bit, so best bet is just to choose one or the other
   return (amt>=128) ? fg : bg;
 }
 
@@ -499,6 +529,44 @@ void graphicsFillEllipse(JsGraphics *gfx, int posX1, int posY1, int posX2, int p
   }
 }
 
+void graphicsFillAnnulus(JsGraphics *gfx, int x0, int y0, int r1, int r2, unsigned short quadrants){
+  graphicsToDeviceCoordinates(gfx, &x0, &y0);
+  int x = 0;
+  int y1 = r1;
+  int y2 = r2;
+  int d1 = 3-2*r1;
+  int d2 = 3-2*r2;
+  do {
+    if (quadrants & 0x01) {   // Will currently overdraw into other quadrants if r1 <= (r2/2)
+      graphicsFillRectDevice(gfx, x0+x, y0-y1, x0+x, y0-y2, gfx->data.fgColor);
+      graphicsFillRectDevice(gfx, x0+y1, y0-x, x0+y2, y0-x, gfx->data.fgColor);
+    }
+    if (quadrants & 0x02) {
+      graphicsFillRectDevice(gfx, x0+x, y0+y1, x0+x, y0+y2, gfx->data.fgColor);
+      graphicsFillRectDevice(gfx, x0+y1, y0+x, x0+y2, y0+x, gfx->data.fgColor);
+    }
+    if (quadrants & 0x04) {
+      graphicsFillRectDevice(gfx, x0-x, y0+y1, x0-x, y0+y2, gfx->data.fgColor);
+      graphicsFillRectDevice(gfx, x0-y1, y0+x, x0-y2, y0+x, gfx->data.fgColor);
+    }
+    if (quadrants & 0x08) {
+      graphicsFillRectDevice(gfx, x0-x, y0-y1, x0-x, y0-y2, gfx->data.fgColor);
+      graphicsFillRectDevice(gfx, x0-y1, y0-x, x0-y2, y0-x, gfx->data.fgColor);
+    }
+    x++;
+    if (d1 > 0) {
+      y1--;
+      d1 += 4*(x-y1)+10;
+    }
+    else d1 += 4*x+6;
+    if (d2 > 0) {
+      y2--;
+      d2 += 4*(x-y2)+10;
+    }
+    else d2 += 4*x+6;
+  } while (y2 >= x);
+}
+
 void graphicsDrawLine(JsGraphics *gfx, int x1, int y1, int x2, int y2) {
   graphicsToDeviceCoordinates(gfx, &x1, &y1);
   graphicsToDeviceCoordinates(gfx, &x2, &y2);
@@ -604,6 +672,45 @@ void graphicsDrawLineAA(JsGraphics *gfx, int ix1, int iy1, int ix2, int iy2) {
     intery += gradient;
   }
 }
+
+void graphicsDrawCircleAA(JsGraphics *gfx, int x0, int y0, int r){
+  graphicsToDeviceCoordinates(gfx, &x0, &y0);
+  int x = -r;
+  int y = 0;
+  int err = 2-2*r;
+  int i, x2, e2;
+  r = 1-err;
+  do {
+     i = 255-255*abs(err-2*(x+y)-2)/r;  
+     graphicsSetPixelDeviceBlended(gfx, x0-x, y0+y, i);
+     graphicsSetPixelDeviceBlended(gfx, x0-y, y0-x, i);
+     graphicsSetPixelDeviceBlended(gfx, x0+x, y0-y, i);
+     graphicsSetPixelDeviceBlended(gfx, x0+y, y0+x, i);
+     e2 = err;
+     x2 = x;
+     if (err+y > 0) {               // X step
+        i = 255-255*(err-2*x-1)/r;  // Outward pixel
+        if (i > 0) {
+           graphicsSetPixelDeviceBlended(gfx, x0-x, y0+y+1, i);
+           graphicsSetPixelDeviceBlended(gfx, x0-y-1, y0-x, i);
+           graphicsSetPixelDeviceBlended(gfx, x0+x, y0-y-1, i);
+           graphicsSetPixelDeviceBlended(gfx, x0+y+1, y0+x, i);
+        }
+        err += ++x*2+1;
+     }
+     if (e2+x2 <= 0) {              // Y step
+        i = 255-255*(2*y+3-e2)/r;   // Inward pixel
+        if (i > 0) {
+           graphicsSetPixelDeviceBlended(gfx, x0-x2-1, y0+y, i);
+           graphicsSetPixelDeviceBlended(gfx, x0-y, y0-x2-1, i);
+           graphicsSetPixelDeviceBlended(gfx, x0+x2+1, y0-y, i);
+           graphicsSetPixelDeviceBlended(gfx, x0+y, y0+x2+1, i);
+        }
+        err += ++y*2+1;
+     }
+  } while (x < 0);
+}
+
 #endif
 
 // Fill poly - each member of vertices is 1/16th pixel
@@ -717,18 +824,30 @@ void graphicsScroll(JsGraphics *gfx, int xdir, int ydir) {
   if (ydir>gfx->data.height) { ydir=gfx->data.height; scroll=false; }
   if (ydir<-gfx->data.height) { ydir=-gfx->data.height; scroll=false; }
   // do the scrolling
-  if (scroll) gfx->scroll(gfx, xdir, ydir);
+#ifdef NO_MODIFIED_AREA
+  x1=0;
+  y1=0;
+  x2=gfx->data.width-1;
+  x2=gfx->data.height-1;
+#else
+  x1=gfx->data.clipRect.x1;
+  y1=gfx->data.clipRect.y1;
+  x2=gfx->data.clipRect.x2;
+  y2=gfx->data.clipRect.y2;
+#endif
+  if (scroll) gfx->scroll(gfx, xdir, ydir, x1,y1,x2,y2);
+  graphicsSetModified(gfx, x1,y1,x2,y2);
   // fill the new area
-  if (xdir>0) gfx->fillRect(gfx,0,0,xdir-1,gfx->data.height-1, gfx->data.bgColor);
-  else if (xdir<0) gfx->fillRect(gfx,gfx->data.width+xdir,0,gfx->data.width-1,gfx->data.height-1, gfx->data.bgColor);
-  if (ydir>0) gfx->fillRect(gfx,0,0,gfx->data.width-1,ydir-1, gfx->data.bgColor);
-  else if (ydir<0) gfx->fillRect(gfx,0,gfx->data.height+ydir,gfx->data.width-1,gfx->data.height-1, gfx->data.bgColor);
+  if (xdir>0) gfx->fillRect(gfx,x1,y1,x1+xdir-1,y2, gfx->data.bgColor);
+  else if (xdir<0) gfx->fillRect(gfx,x2+1+xdir,y1,x2,y2, gfx->data.bgColor);
+  if (ydir>0) gfx->fillRect(gfx,x1,y1,x2,y1+ydir-1, gfx->data.bgColor);
+  else if (ydir<0) gfx->fillRect(gfx,x1,y2+1+ydir,x2,y2, gfx->data.bgColor);
 }
 
 static void graphicsDrawString(JsGraphics *gfx, int x1, int y1, const char *str) {
   // no need to modify coordinates as setPixel does that
   while (*str) {
-    graphicsDrawChar4x6(gfx,x1,y1,*(str++),1,false);
+    graphicsDrawChar4x6(gfx,x1,y1,*(str++),1,1,false);
     x1 = (int)(x1 + 4);
   }
 }
